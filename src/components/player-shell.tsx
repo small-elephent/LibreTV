@@ -29,6 +29,7 @@ import {
   DESKTOP_CONTROL_HIDE_MS,
   TOUCH_CONTROL_HIDE_MS,
 } from '@/lib/control-hide';
+import { createRightArrowHold, RIGHT_ARROW_HOLD_MS, withPlaybackRate3 } from '@/lib/playback-rate';
 
 /** 片段时间统一保留 1 位小数：与面板展示保持一致，避免浮点尾巴 */
 const round1 = (v: number) => Math.round(v * 10) / 10;
@@ -141,6 +142,7 @@ export function PlayerShell({
   // 起播前的品牌占位图（沿用旧版 nomedia 素材），实际开始播放后隐藏
   const [showPoster, setShowPoster] = useState(true);
   const hintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const rightHoldRef = useRef<ReturnType<typeof createRightArrowHold> | null>(null);
 
   // 始终持有最新 props/回调，避免重建播放器
   const propsRef = useRef({
@@ -473,6 +475,7 @@ export function PlayerShell({
   /** 换集：重置每集状态并切换到新 HLS 源（不重建 ArtPlayer）。 */
   const loadEpisode = (targetUrl: string) => {
     if (!targetUrl) return;
+    rightHoldRef.current?.cancel();
     mediaHealthyRef.current = true;
     playbackStartedRef.current = false;
     videoErrorRetryUsedRef.current = false;
@@ -504,6 +507,7 @@ export function PlayerShell({
     // 由「点按视频 toggle」收起。CONTROL_HIDE_TIME 是 static，创建后修改立即生效。
     const touchPointer = prefersTouchPointer();
     Artplayer.CONTROL_HIDE_TIME = touchPointer ? TOUCH_CONTROL_HIDE_MS : DESKTOP_CONTROL_HIDE_MS;
+    Artplayer.PLAYBACK_RATE = withPlaybackRate3(Artplayer.PLAYBACK_RATE);
 
     // 初始化每集状态
     mediaHealthyRef.current = true;
@@ -783,7 +787,14 @@ export function PlayerShell({
     const shortcuts = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
       // 输入框或按钮获得焦点时不劫持按键：否则空格会吞掉按钮的默认激活
-      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.closest('button')) return;
+      if (
+        target.tagName === 'INPUT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.isContentEditable ||
+        target.closest('button')
+      ) {
+        return;
+      }
       const current = artRef.current;
       if (!current) return;
       if (e.altKey && e.key === 'ArrowLeft') { e.preventDefault(); return; } // 由父层处理集数切换
@@ -793,7 +804,17 @@ export function PlayerShell({
           if (current.currentTime > 5) { current.currentTime -= 5; showHint('快退 5s'); e.preventDefault(); }
           break;
         case 'ArrowRight':
-          if (current.duration - current.currentTime > 5) { current.currentTime += 5; showHint('快进 5s'); e.preventDefault(); }
+          if (e.ctrlKey || e.metaKey || e.shiftKey) {
+            if (current.duration - current.currentTime > 5) {
+              current.currentTime += 5;
+              showHint('快进 5s');
+              e.preventDefault();
+            }
+            break;
+          }
+          if (rightHoldRef.current?.onKeyDown({ repeat: e.repeat, paused: Boolean(current.video?.paused) })) {
+            e.preventDefault();
+          }
           break;
         case 'ArrowUp':
           if (current.volume < 1) { current.volume = Math.min(1, current.volume + 0.1); showHint(`音量 ${Math.round(current.volume * 100)}%`); e.preventDefault(); }
@@ -848,7 +869,33 @@ export function PlayerShell({
         }
       }
     };
+    const rightHold = createRightArrowHold({
+      getRate: () => art.video?.playbackRate ?? 1,
+      setRate: (rate) => {
+        if (art.video) art.video.playbackRate = rate;
+      },
+      seek: () => {
+        const playing = artRef.current;
+        if (!playing) return false;
+        if (playing.duration - playing.currentTime > 5) {
+          playing.currentTime += 5;
+          showHint('快进 5s');
+          return true;
+        }
+        return false;
+      },
+      isPaused: () => Boolean(art.video?.paused),
+      onHint: showHint,
+    });
+    rightHoldRef.current = rightHold;
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key !== 'ArrowRight' || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      if (rightHold.onKeyUp()) e.preventDefault();
+    };
+    const cancelRightHold = () => rightHold.cancel();
     document.addEventListener('keydown', shortcuts);
+    document.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', cancelRightHold);
 
     // —— 移动端长按 3 倍速 ——
     let longPressTimer: ReturnType<typeof setTimeout> | null = null;
@@ -893,7 +940,7 @@ export function PlayerShell({
         art.video.playbackRate = 3.0;
         isLongPress = true;
         showHint('3 倍速');
-      }, 500);
+      }, RIGHT_ARROW_HOLD_MS);
     };
     const onTouchEnd = () => {
       if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
@@ -917,8 +964,9 @@ export function PlayerShell({
 
     // 卸载与页面隐藏时保存进度
     const saveOnHide = () => {
-      if (document.visibilityState === 'hidden' && !endedRef.current) {
-        propsRef.current.onPause?.(art.currentTime, art.duration);
+      if (document.visibilityState === 'hidden') {
+        rightHold.cancel();
+        if (!endedRef.current) propsRef.current.onPause?.(art.currentTime, art.duration);
       }
     };
     document.addEventListener('visibilitychange', saveOnHide);
@@ -931,7 +979,11 @@ export function PlayerShell({
           propsRef.current.onPause?.(art.currentTime, art.duration);
         } catch { /* 忽略 */ }
       }
+      rightHold.cancel();
+      rightHoldRef.current = null;
       document.removeEventListener('keydown', shortcuts);
+      document.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', cancelRightHold);
       document.removeEventListener('visibilitychange', saveOnHide);
       volumeBoostRef.current?.dispose();
       volumeBoostRef.current = null;
