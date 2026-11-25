@@ -20,7 +20,7 @@ import {
 import { loadCacheSettings, saveCacheSettings, getCacheSummary, clearVideoCache, type CacheSummary } from '@/lib/video-cache';
 import { EmptyState, Spinner } from './states';
 import { useSourceProbe } from './use-source-probe';
-import { allLiveSources, isSourceDisabled, keyBelongsToSubscription, resolveSource, subKeyPrefix, useAppStore } from '@/lib/store';
+import { allLiveSources, keyBelongsToSubscription, resolveSource, subKeyPrefix, useAppStore } from '@/lib/store';
 import type { SourceConfig } from '@/lib/types';
 import { useToast } from './toast';
 import { formatRelativeTime, hostnameOf, validateSourceUrl, cn } from '@/lib/utils';
@@ -235,9 +235,10 @@ function VodSourcesPanel() {
     const q = query.trim().toLowerCase();
     return all.filter((s) => {
       const fromSub = s.key.startsWith('sub_');
-      // 已启用 = 勾选中且当前未被自动停用（即真正在参与搜索的源）
-      if (filter === 'enabled' && !(store.selectedKeys.includes(s.key) && !isSourceDisabled(store, s.key))) return false;
-      if (filter === 'disabled' && !isSourceDisabled(store, s.key)) return false;
+      const selected = store.selectedKeys.includes(s.key);
+      // 已启用 / 已停用只看用户勾选，不看历史健康度
+      if (filter === 'enabled' && !selected) return false;
+      if (filter === 'disabled' && selected) return false;
       if (filter === 'sub' && !fromSub) return false;
       // 手动添加 = 既非订阅导入、也非部署者预置
       if (filter === 'manual' && (fromSub || envKeys.has(s.key))) return false;
@@ -269,14 +270,6 @@ function VodSourcesPanel() {
     const result = await probe(filtered.map((s) => ({ key: s.key, url: s.url })));
     if (!result) return; // 被取消则无汇总
     toast(`测活完成：${result.ok}/${result.total} 个可用`, result.ok === result.total ? 'success' : 'info');
-  };
-
-  /** 一键恢复被自动停用的源（仅「已停用」筛选下提供） */
-  const restoreAll = () => {
-    const keys = filtered.filter((s) => isSourceDisabled(store, s.key)).map((s) => s.key);
-    if (keys.length === 0) return;
-    keys.forEach((k) => useAppStore.getState().clearSourceHealth(k));
-    toast(`已恢复 ${keys.length} 个源`, 'success');
   };
 
   const empty = store.envSources.length === 0 && store.customAPIs.length === 0;
@@ -345,12 +338,6 @@ function VodSourcesPanel() {
               >
                 {isProbing ? '取消测活' : '批量测活'}
               </button>
-              {/* 查看「已停用」时提供一键恢复，省去逐个点击 */}
-              {filter === 'disabled' && (
-                <button className="btn-ghost btn-sm" onClick={restoreAll} disabled={filtered.length === 0}>
-                  全部恢复
-                </button>
-              )}
             </div>
             {progress && (
               <div className="flex items-center gap-2 text-[11px] text-muted">
@@ -841,14 +828,14 @@ function SourceSubscriptions() {
   } | null>(null);
 
   /**
-   * 发布当前「已勾选启用」的源：只把真正在参与搜索的源发出去
-   * （未勾选的、以及被自动停用的都排除）。注意这与「导出数据源」的全量语义不同。
+   * 发布当前「已勾选启用」的源。未勾选的不发出去。
+   * 历史健康度停用不排除。注意这与「导出数据源」的全量语义不同。
    */
   const publish = async () => {
     const seen = new Set<string>();
     const sources = store.selectedKeys
       .map((key) => resolveSource(store, key))
-      .filter((s): s is SourceConfig => !!s && validateSourceUrl(s.url) && !isSourceDisabled(store, s.key))
+      .filter((s): s is SourceConfig => !!s && validateSourceUrl(s.url))
       .filter((s) => {
         const key = s.url.replace(/\/+$/, '');
         if (seen.has(key)) return false;

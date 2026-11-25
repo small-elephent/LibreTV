@@ -1,9 +1,8 @@
 'use client';
 
 import { useCallback, useState, type ReactNode } from 'react';
-import { cn, formatDisableTtl } from '@/lib/utils';
-import { isInDisabledSubscription, useAppStore } from '@/lib/store';
-import { useToast } from './toast';
+import { cn } from '@/lib/utils';
+import { isInDisabledSubscription, sourceHealthBadge, useAppStore } from '@/lib/store';
 import { Icon } from './icon';
 import { Dropdown, type DropdownOption } from './dropdown';
 import { Spinner } from './states';
@@ -219,11 +218,10 @@ export function TestBadge({
   );
 }
 
-/** 点播源搜索健康度徽章（随搜索/批量测活滚动更新）；被自动停用的源提供手动恢复入口 */
+/** 点播源搜索健康度徽章（随搜索/批量测活滚动更新）。失败只展示真实结果，不暂停源。 */
 export function HealthBadge({ sourceKey }: { sourceKey: string }) {
   const entry = useAppStore((s) => s.sourceHealth[sourceKey]);
   const inDisabledSub = useAppStore((s) => isInDisabledSubscription(s, sourceKey));
-  const { toast } = useToast();
 
   // 订阅被整体关闭时优先说明原因：否则源看起来「勾选正常却搜不到」，用户会以为是源坏了
   if (inDisabledSub) {
@@ -237,60 +235,20 @@ export function HealthBadge({ sourceKey }: { sourceKey: string }) {
     );
   }
 
-  if (!entry) return null;
+  const badge = sourceHealthBadge(entry);
+  if (!badge) return null;
 
-  const permanent = entry.permanent === true;
-  const disabled = permanent || (!!entry.disabledUntil && entry.disabledUntil > Date.now());
-  if (disabled) {
-    // 长期停用（阶梯用尽）没有到期时间，展示为红色并提示需手动恢复
-    const remainText = formatDisableTtl((entry.disabledUntil ?? 0) - Date.now());
-    return (
-      <span className="flex items-center gap-1 shrink-0">
-        <span
-          className={cn(
-            'inline-flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded',
-            permanent ? 'bg-danger/15 text-danger' : 'bg-warning/15 text-warning'
-          )}
-          title={
-            permanent
-              ? `已第 ${entry.disableCount} 次被自动停用，暂停参与搜索；点「恢复」重新启用`
-              : `连续 ${entry.failStreak} 次超时/失败，${remainText}后自动恢复`
-          }
-        >
-          <Icon name="clock" className="w-3 h-3" />
-          {permanent ? '已停用' : remainText}
-        </span>
-        <button
-          className="text-[10px] px-1.5 py-0.5 rounded text-muted hover:text-accent hover:bg-hover transition-colors"
-          aria-label="恢复此源"
-          title="清除健康度记录，立即恢复参与搜索"
-          onClick={() => {
-            useAppStore.getState().clearSourceHealth(sourceKey);
-            toast('已恢复，下次搜索重新参与', 'success');
-          }}
-        >
-          恢复
-        </button>
-      </span>
-    );
-  }
-
-  if (entry.ok) {
-    return (
-      <span className="text-[10px] px-1.5 py-0.5 rounded bg-success/15 text-success shrink-0" title={`上次搜索 ${entry.ms}ms`}>
-        ✓ {entry.ms}ms
-      </span>
-    );
-  }
   return (
     <span
       className={cn(
         'text-[10px] px-1.5 py-0.5 rounded shrink-0',
-        entry.timedOut ? 'bg-warning/15 text-warning' : 'bg-danger/15 text-danger'
+        badge.tone === 'ok' && 'bg-success/15 text-success',
+        badge.tone === 'warning' && 'bg-warning/15 text-warning',
+        badge.tone === 'danger' && 'bg-danger/15 text-danger'
       )}
-      title={entry.error}
+      title={badge.title}
     >
-      连续 {entry.failStreak} 次失败
+      {badge.text}
     </span>
   );
 }
