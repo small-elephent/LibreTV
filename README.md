@@ -107,6 +107,8 @@ PASSWORD=your-password npm start   # 监听 8080
 | --- | --- | --- |
 | `PASSWORD` | 是 | 访问密码；未设置时站点会提示管理员配置 |
 | `PROXY_SECRET` | 否 | 会话/代理签名密钥；不设置时从 PASSWORD 派生（多实例部署建议显式设置） |
+| `HTTP_PROXY` / `HTTPS_PROXY` | 否 | 搜索、详情、图片/媒体代理和直播列表的上游代理，例如 `http://127.0.0.1:7897`。只支持 `http://` 与 `https://`（HTTP CONNECT），与 `node --use-env-proxy` 读的是同一组变量。未设置、或值不是 http(s) 时直接连接。代理只隧道到已经过 SSRF 校验并钉死的 IP，TLS 仍用原主机名做 SNI；本地 DNS 失败不会改成把主机名交给代理解析。`NO_PROXY` 命中的主机直接连接。代理地址视为受信任配置。 |
+| `NO_PROXY` | 否 | 逗号或空格分隔的不走代理的主机。`*` 表示全部直连；`*` / `.` 开头按后缀匹配，也可写 `主机:端口` |
 | `DEFAULT_SOURCES` | 否 | 预置采集站（JSON 数组），用户端自动出现且默认勾选，详见[配置文档](https://libretv.is-an.org/wiki/Configuration.html) |
 | `REQUEST_TIMEOUT` | 否 | 代理上游请求超时（毫秒），默认 8000 |
 | `MAX_RETRIES` | 否 | 代理请求重试次数，默认 1 |
