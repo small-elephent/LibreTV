@@ -888,8 +888,10 @@ export function PlayerShell({
       onHint: showHint,
     });
     rightHoldRef.current = rightHold;
+    // 按下右方向键之后才按住 Shift/Ctrl，松开时事件仍带修饰键。
+    // 只要这次按键已经进入手势，就必须结束它；没进入时 onKeyUp 是空操作，不会多快进一次。
     const onKeyUp = (e: KeyboardEvent) => {
-      if (e.key !== 'ArrowRight' || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      if (e.key !== 'ArrowRight') return;
       if (rightHold.onKeyUp()) e.preventDefault();
     };
     const cancelRightHold = () => rightHold.cancel();

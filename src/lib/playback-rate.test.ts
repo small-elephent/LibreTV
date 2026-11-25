@@ -17,6 +17,15 @@ describe('withPlaybackRate3', () => {
     const src = readFileSync('src/components/live-player.tsx', 'utf8');
     expect(src).toContain('playbackRate: false');
   });
+
+  it('松开右方向键时不因中途按下的修饰键跳过恢复', () => {
+    const src = readFileSync('src/components/player-shell.tsx', 'utf8');
+    const start = src.indexOf('const onKeyUp');
+    const end = src.indexOf('const cancelRightHold');
+    const fn = src.slice(start, end);
+    expect(fn).toContain("e.key !== 'ArrowRight'");
+    expect(fn).not.toMatch(/altKey|ctrlKey|metaKey|shiftKey/);
+  });
 });
 
 describe('右方向键长按 3 倍', () => {
