@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import { useQuery } from '@tanstack/react-query';
 import { Header } from '@/components/header';
 import { RecommendSection } from '@/components/douban-section';
+import { DiscoveryStrip } from '@/components/discovery-strip';
 import { DetailModal } from '@/components/detail-modal';
 import { AggregatedCard, aggregateResults } from '@/components/video-card';
 import { useAppStore, resolveSource, isInDisabledSubscription, sourceEligibleForSearch } from '@/lib/store';
@@ -338,6 +339,16 @@ function HomeContent() {
               />
             )}
           </section>
+        )}
+
+        {/* 策展在推荐区之上；有搜索时两者都让开结果 */}
+        {!urlQuery && (
+          <DiscoveryStrip
+            onPick={(title) => {
+              setInput(title);
+              runSearch(title);
+            }}
+          />
         )}
 
         {/* 首页推荐（有搜索时隐藏） */}
