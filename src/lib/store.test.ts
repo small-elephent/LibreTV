@@ -8,7 +8,14 @@ vi.mock('./db', () => ({
   saveLiveProbeResults: vi.fn(async () => {}),
 }));
 
-import { isInDisabledSubscription, isSourceDisabled, keyBelongsToSubscription, SOURCE_DISABLE_LADDER, subKeyPrefix, useAppStore } from './store';
+import {
+  isInDisabledSubscription,
+  keyBelongsToSubscription,
+  sourceEligibleForSearch,
+  sourceHealthBadge,
+  subKeyPrefix,
+  useAppStore,
+} from './store';
 import type { SourceConfig } from './types';
 
 const store = () => useAppStore.getState();
@@ -273,81 +280,148 @@ describe('可撤销删除与订阅同步状态', () => {
   });
 });
 
-describe('点播源自动停用阶梯', () => {
-  const fail = (key: string) => ({ sourceKey: key, ok: false, error: '超时', list: [] });
-  const okOutcome = (key: string) => ({ sourceKey: key, ok: true, ms: 12, list: [] });
-  /** 连续两次搜索失败（每次搜索各记录一次），返回两次调用产生的停用事件合集 */
-  const failTwice = (key: string) => [
-    ...store().recordSourceHealth([fail(key)]),
-    ...store().recordSourceHealth([fail(key)]),
-  ];
-  /** 模拟停用到期：把截止时间挪到过去 */
-  const expire = (key: string) => {
-    const entry = store().sourceHealth[key];
+describe('点播源失败不自动停用', () => {
+  const fail = (key: string, error = '请求超时（>10s）', timedOut = true) => ({
+    sourceKey: key,
+    ok: false as const,
+    error,
+    timedOut,
+    list: [],
+  });
+  const okOutcome = (key: string) => ({ sourceKey: key, ok: true as const, ms: 12, list: [] });
+
+  beforeEach(() => useAppStore.setState({ sourceHealth: {}, selectedKeys: [], subscriptions: [] }));
+
+  it('连续多次失败后，下一次搜索仍参与，且不写入停用截止时间', () => {
+    useAppStore.setState({ selectedKeys: ['a'] });
+    for (let i = 0; i < 5; i++) store().recordSourceHealth([fail('a')]);
+
+    const entry = store().sourceHealth.a;
+    expect(entry.failStreak).toBe(5);
+    expect(entry.ok).toBe(false);
+    expect(entry.error).toBe('请求超时（>10s）');
+    expect(entry.timedOut).toBe(true);
+    expect(entry.disabledUntil).toBeUndefined();
+    expect(entry.permanent).toBeUndefined();
+    expect(sourceEligibleForSearch(store(), 'a')).toBe(true);
+  });
+
+  it('历史 disabledUntil 与 permanent 不排除已启用源，也不清除这些记录', () => {
+    const until = Date.now() + 27 * 60 * 1000;
     useAppStore.setState({
-      sourceHealth: { ...store().sourceHealth, [key]: { ...entry, disabledUntil: Date.now() - 1 } },
+      selectedKeys: ['paused', 'forever'],
+      sourceHealth: {
+        paused: {
+          ok: false,
+          error: '请求超时（>10s）',
+          timedOut: true,
+          failStreak: 2,
+          disabledUntil: until,
+          timestamp: Date.now(),
+        },
+        forever: {
+          ok: false,
+          error: 'HTTP 500',
+          failStreak: 6,
+          permanent: true,
+          disableCount: 3,
+          timestamp: Date.now(),
+        },
+      },
     });
-  };
 
-  beforeEach(() => useAppStore.setState({ sourceHealth: {} }));
-
-  it('达到阈值才停用，首次为 30 分钟', () => {
-    expect(store().recordSourceHealth([fail('a')])).toEqual([]);
-    expect(isSourceDisabled(store(), 'a')).toBe(false);
-
-    const events = failTwice('a');
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ key: 'a', level: 1, permanent: false, ttlMs: SOURCE_DISABLE_LADDER[0] });
-    expect(isSourceDisabled(store(), 'a')).toBe(true);
+    expect(sourceEligibleForSearch(store(), 'paused')).toBe(true);
+    expect(sourceEligibleForSearch(store(), 'forever')).toBe(true);
+    // 只读判断，不改写 localStorage 里的历史字段
+    expect(store().sourceHealth.paused.disabledUntil).toBe(until);
+    expect(store().sourceHealth.forever.permanent).toBe(true);
+    expect(store().sourceHealth.forever.disableCount).toBe(3);
   });
 
-  it('到期恢复后再次连续失败 → 升级为 24 小时', () => {
-    failTwice('a');
-    expire('a');
-    // 到期即恢复参与搜索（懒判断，无需清理标记）
-    expect(isSourceDisabled(store(), 'a')).toBe(false);
+  it('记录另一个源的健康度时，保留未参与源的历史停用字段', () => {
+    const until = Date.now() + 26 * 60 * 1000;
+    useAppStore.setState({
+      sourceHealth: {
+        paused: {
+          ok: false,
+          error: '超时',
+          failStreak: 2,
+          disabledUntil: until,
+          permanent: true,
+          timestamp: Date.now(),
+        },
+      },
+    });
 
-    const events = failTwice('a');
-    expect(events[0]).toMatchObject({ level: 2, permanent: false, ttlMs: SOURCE_DISABLE_LADDER[1] });
+    store().recordSourceHealth([fail('other', 'HTTP 502', false)]);
+
+    expect(store().sourceHealth.paused.disabledUntil).toBe(until);
+    expect(store().sourceHealth.paused.permanent).toBe(true);
+    expect(store().sourceHealth.other.disabledUntil).toBeUndefined();
+    expect(store().sourceHealth.other.permanent).toBeUndefined();
+    expect(store().sourceHealth.other.error).toBe('HTTP 502');
   });
 
-  it('阶梯用尽 → 长期停用，不随到期恢复，须手动清除', () => {
-    failTwice('a');
-    expire('a');
-    failTwice('a');
-    expire('a');
-    const events = failTwice('a');
-    expect(events[0]).toMatchObject({ level: 3, permanent: true });
-    expect(events[0].ttlMs).toBeUndefined();
+  it('手动取消勾选与订阅关闭仍然不参与搜索', () => {
+    const subUrl = 'https://sub.example.com/list.json';
+    store().addSubscription(subUrl, 'S');
+    const subKey = `${subKeyPrefix(subUrl)}_0`;
+    useAppStore.setState({
+      selectedKeys: ['kept', subKey],
+      sourceHealth: {
+        kept: {
+          ok: false,
+          error: '超时',
+          failStreak: 4,
+          disabledUntil: Date.now() + 60_000,
+          permanent: true,
+          timestamp: Date.now(),
+        },
+      },
+    });
+    store().setSubscriptionEnabled(subUrl, false);
 
-    // 即便把停用时间挪到过去也不会自动恢复
-    expire('a');
-    expect(isSourceDisabled(store(), 'a')).toBe(true);
-
-    store().clearSourceHealth('a');
-    expect(isSourceDisabled(store(), 'a')).toBe(false);
+    expect(sourceEligibleForSearch(store(), 'kept')).toBe(true);
+    expect(sourceEligibleForSearch(store(), 'manual-off')).toBe(false);
+    expect(sourceEligibleForSearch(store(), subKey)).toBe(false);
+    expect(isInDisabledSubscription(store(), subKey)).toBe(true);
+    expect(store().selectedKeys).toEqual(['kept', subKey]);
   });
 
-  it('成功一次降一级：偶发抽风的源不会一路升到长期停用', () => {
-    failTwice('a'); // 第 1 级
-    expire('a');
-    failTwice('a'); // 第 2 级
-    expire('a');
+  it('成功后失败连击归零，健康度徽章不显示自动暂停', () => {
+    useAppStore.setState({
+      sourceHealth: {
+        a: {
+          ok: false,
+          error: '请求超时（>10s）',
+          timedOut: true,
+          failStreak: 4,
+          disabledUntil: Date.now() + 29 * 60 * 1000,
+          permanent: true,
+          disableCount: 3,
+          timestamp: Date.now(),
+        },
+      },
+    });
+
+    const pausedBadge = sourceHealthBadge(store().sourceHealth.a);
+    expect(pausedBadge).toEqual({
+      tone: 'warning',
+      text: '连续 4 次失败',
+      title: '请求超时（>10s）',
+    });
+    expect(pausedBadge?.text).not.toMatch(/分钟|已停用|恢复/);
 
     store().recordSourceHealth([okOutcome('a')]);
-    expect(store().sourceHealth['a'].disableCount).toBe(1);
-
-    const events = failTwice('a');
-    expect(events[0]).toMatchObject({ level: 2, permanent: false });
-  });
-
-  it('成功后立即清除停用标记与失败连击', () => {
-    failTwice('a');
-    expect(isSourceDisabled(store(), 'a')).toBe(true);
-
-    store().recordSourceHealth([okOutcome('a')]);
-    expect(isSourceDisabled(store(), 'a')).toBe(false);
-    expect(store().sourceHealth['a'].failStreak).toBe(0);
+    expect(store().sourceHealth.a.failStreak).toBe(0);
+    expect(store().sourceHealth.a.ok).toBe(true);
+    expect(store().sourceHealth.a.disabledUntil).toBeUndefined();
+    expect(sourceHealthBadge(store().sourceHealth.a)).toEqual({
+      tone: 'ok',
+      text: '✓ 12ms',
+      title: '上次搜索 12ms',
+    });
+    expect(sourceHealthBadge(undefined)).toBeNull();
   });
 });
 

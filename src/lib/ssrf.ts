@@ -1,8 +1,10 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import type { LookupAddress } from 'node:dns';
 import { lookup as callbackLookup } from 'node:dns';
 import dns from 'node:dns/promises';
-import { Agent, buildConnector, fetch as undiciFetch } from 'undici';
+import { Agent, Dispatcher, Pool, buildConnector, fetch as undiciFetch } from 'undici';
+import type { Socket } from 'node:net';
+import type { LookupAddress } from 'node:dns';
+import { hasConfiguredHttpProxy, selectEnvProxy } from './env-proxy';
 
 /** 去掉 URL.hostname 对 IPv6 附加的方括号（"[::1]" → "::1"） */
 function stripBrackets(host: string): string {
@@ -121,89 +123,187 @@ export interface SSRFProtectionContext {
 
 const ssrfStorage = new AsyncLocalStorage<SSRFProtectionContext>();
 
+function ssrfError(message: string): NodeJS.ErrnoException {
+  return Object.assign(new Error(message), { code: 'ERR_SSRF_BLOCKED' });
+}
+
+function isLiteralAddress(host: string): boolean {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':');
+}
+
+/** 连接时解析。任一结果落在私网/保留地址即拒绝，调用方只能连到返回的地址。 */
+function lookupAll(hostname: string, allowPrivate: boolean): Promise<LookupAddress[]> {
+  const cleanHost = stripBrackets(hostname);
+  if (!allowPrivate && BLOCKED_HOSTNAMES.has(cleanHost.toLowerCase())) {
+    return Promise.reject(ssrfError(`目标主机名在黑名单中 (${hostname})`));
+  }
+  if (!allowPrivate && isLiteralAddress(cleanHost) && isPrivateIP(cleanHost)) {
+    return Promise.reject(ssrfError(`目标地址属于私有/保留网络 (${cleanHost})`));
+  }
+  return new Promise((resolve, reject) => {
+    callbackLookup(cleanHost, { all: true }, (err, addresses) => {
+      if (err) return reject(err);
+      const list = Array.isArray(addresses) ? addresses : [];
+      if (list.length === 0) return reject(new Error(`未找到主机地址: ${hostname}`));
+      if (!allowPrivate) {
+        const bad = list.find((item) => isPrivateIP(item.address));
+        if (bad) return reject(ssrfError(`目标地址解析到私有/保留网络 (${bad.address})`));
+      }
+      resolve(list);
+    });
+  });
+}
+
+type ConnectOpts = buildConnector.Options & { protocol?: string; signal?: AbortSignal };
+
+/**
+ * 直连连接器。DNS 结果就是真正拨号的地址，因此重绑定无法在检查之后换成另一个 IP。
+ */
+function makeDirectConnect(allowPrivate: boolean): buildConnector.connector {
+  const lookup = (
+    hostname: string,
+    opts: unknown,
+    cb: (err: NodeJS.ErrnoException | null, address?: string | LookupAddress[], family?: number) => void
+  ) => {
+    lookupAll(hostname, allowPrivate).then(
+      (list) => {
+        const wantAll = Boolean(opts && typeof opts === 'object' && (opts as { all?: boolean }).all);
+        if (wantAll) cb(null, list);
+        else cb(null, list[0].address, list[0].family);
+      },
+      (err: NodeJS.ErrnoException) => cb(err, '')
+    );
+  };
+  const baseConnector = buildConnector({
+    lookup: lookup as unknown as (hostname: string, options: import('node:dns').LookupOptions, callback: (err: NodeJS.ErrnoException | null, address: string | LookupAddress[], family?: number) => void) => void,
+  });
+  return (opts, cb) => {
+    const cleanHost = stripBrackets(opts.hostname || '');
+    if (!allowPrivate) {
+      if (BLOCKED_HOSTNAMES.has(cleanHost.toLowerCase())) {
+        return cb(ssrfError(`目标主机名在黑名单中 (${cleanHost})`), null);
+      }
+      if (isLiteralAddress(cleanHost) && isPrivateIP(cleanHost)) {
+        return cb(ssrfError(`目标地址属于私有/保留网络 (${cleanHost})`), null);
+      }
+    }
+    return baseConnector(opts, cb);
+  };
+}
+
 /**
  * 创建受连接级 SSRF / DNS Rebinding 防护的专用 undici Agent。
  *
  * 核心机制（解决 #941）：
  * 1. 独立 Dispatcher：避免复用全局或其他作用域的连接池，杜绝通过已有的 keep-alive socket 绕过连接层校验；
  * 2. 连接前检查：拦截目标为字面量私网 IP 及黑名单主机名（如 127.0.0.1、localhost）；
- * 3. 连接时 DNS 校验：通过 safeLookup（使用标准 callback 签名的 node:dns 接口）解析域名，
- *    只要解析结果包含任何私网/保留 IP，立即抛出 ERR_SSRF_BLOCKED 中断连接，杜绝 DNS Rebinding TOCTOU 绕过；
+ * 3. 连接时 DNS 校验：解析域名，只要结果包含任何私网/保留 IP，立即抛出 ERR_SSRF_BLOCKED，
+ *    并且随后的 TCP 只能连到这次解析出来的地址，杜绝 DNS Rebinding TOCTOU；
  * 4. 禁用连接保活：使用完毕即释放连接，不留复用窗口。
  */
 export function createSSRFAgent(options: { allowPrivate?: boolean } = {}): Agent {
-  const { allowPrivate = false } = options;
-
-  function safeLookup(
-    hostname: string,
-    opts: unknown,
-    cb: (err: NodeJS.ErrnoException | null, address?: string | LookupAddress[], family?: number) => void
-  ): void {
-    const cleanHost = stripBrackets(hostname);
-    if (!allowPrivate && BLOCKED_HOSTNAMES.has(cleanHost.toLowerCase())) {
-      const blockErr = Object.assign(new Error(`目标主机名在黑名单中 (${hostname})`), {
-        code: 'ERR_SSRF_BLOCKED',
-      });
-      return cb(blockErr, '');
-    }
-
-    callbackLookup(cleanHost, { all: true }, (err, addresses) => {
-      if (err) return cb(err, '');
-      const list = Array.isArray(addresses) ? addresses : [];
-      if (list.length === 0) {
-        return cb(new Error(`未找到主机地址: ${hostname}`), '');
-      }
-      if (!allowPrivate) {
-        for (const item of list) {
-          if (isPrivateIP(item.address)) {
-            const blockErr = Object.assign(new Error(`目标地址解析到私有/保留网络 (${item.address})`), {
-              code: 'ERR_SSRF_BLOCKED',
-            });
-            return cb(blockErr, '');
-          }
-        }
-      }
-
-      const wantAll = opts && typeof opts === 'object' && (opts as { all?: boolean }).all;
-      if (wantAll) {
-        cb(null, list);
-      } else {
-        cb(null, list[0].address, list[0].family);
-      }
-    });
-  }
-
-  const baseConnector = buildConnector({
-    lookup: safeLookup as unknown as (hostname: string, options: import('node:dns').LookupOptions, callback: (err: NodeJS.ErrnoException | null, address: string | import('node:dns').LookupAddress[], family?: number) => void) => void,
-  });
-
-  function ssrfConnect(opts: buildConnector.Options, cb: buildConnector.Callback) {
-    const cleanHost = stripBrackets(opts.hostname || '');
-    if (!allowPrivate) {
-      if (BLOCKED_HOSTNAMES.has(cleanHost.toLowerCase())) {
-        const blockErr = Object.assign(new Error(`目标主机名在黑名单中 (${cleanHost})`), {
-          code: 'ERR_SSRF_BLOCKED',
-        });
-        return cb(blockErr, null);
-      }
-      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(cleanHost) || cleanHost.includes(':')) {
-        if (isPrivateIP(cleanHost)) {
-          const blockErr = Object.assign(new Error(`目标地址属于私有/保留网络 (${cleanHost})`), {
-            code: 'ERR_SSRF_BLOCKED',
-          });
-          return cb(blockErr, null);
-        }
-      }
-    }
-    return baseConnector(opts, cb);
-  }
-
   return new Agent({
-    connect: ssrfConnect,
+    connect: makeDirectConnect(options.allowPrivate === true),
     pipelining: 0,
     keepAliveTimeout: 1,
     keepAliveMaxTimeout: 1,
   });
+}
+
+/**
+ * 经 HTTP CONNECT 代理出网，同时保住上面的钉死。
+ *
+ * 约束：隧道的 CONNECT 目标是刚校验过的 IP，不是主机名。代理因此不能自己再解析一次，
+ * TLS 的 SNI 仍用原来的主机名。本地 DNS 失败就失败，不会退回「把主机名交给代理解析」，
+ * 否则重绑定防护就没了。私网地址在 allowPrivate 时改为直连，不让代理去连内网。
+ * 代理本身来自环境变量，视为受信任，连接代理时不做 SSRF 拦截。
+ */
+function makePinnedProxy(proxyRaw: string, allowPrivate: boolean): { agent: Agent; pool: Pool } {
+  const proxyUrl = new URL(proxyRaw);
+  const proxyPort = Number(proxyUrl.port) || (proxyUrl.protocol === 'https:' ? 443 : 80);
+  const pool = new Pool(proxyUrl.origin, {
+    connect: buildConnector({}),
+    pipelining: 0,
+  });
+  const directConnect = makeDirectConnect(allowPrivate);
+  const tlsConnect = buildConnector({});
+  const auth =
+    proxyUrl.username || proxyUrl.password
+      ? `Basic ${Buffer.from(`${decodeURIComponent(proxyUrl.username)}:${decodeURIComponent(proxyUrl.password)}`).toString('base64')}`
+      : undefined;
+  const agent = new Agent({
+    connect: (opts, cb) => {
+      const target = opts as ConnectOpts;
+      void (async () => {
+        const hostname = stripBrackets(target.hostname || '');
+        const list = await lookupAll(hostname, allowPrivate);
+        const pinned = list[0];
+        if (isPrivateIP(pinned.address)) {
+          directConnect(target, cb);
+          return;
+        }
+        const endpoint = pinned.address.includes(':') ? `[${pinned.address}]` : pinned.address;
+        const port = Number(target.port) || (target.protocol === 'https:' ? 443 : 80);
+        const authority = `${endpoint}:${port}`;
+        const connected = await pool.connect({
+          origin: proxyUrl.origin,
+          path: authority,
+          signal: target.signal,
+          headers: { host: authority, ...(auth ? { 'proxy-authorization': auth } : {}) },
+          port: proxyPort,
+          servername: proxyUrl.hostname,
+        } as Dispatcher.ConnectOptions);
+        const tunnel = connected.socket as Socket;
+        if (connected.statusCode !== 200) {
+          tunnel.on('error', () => {}).destroy();
+          cb(new Error(`代理隧道失败 (${connected.statusCode})`), null);
+          return;
+        }
+        if (target.protocol !== 'https:') {
+          cb(null, tunnel);
+          return;
+        }
+        tlsConnect(
+          { ...target, servername: target.servername || hostname, httpSocket: tunnel },
+          cb
+        );
+      })().catch((err: Error) => cb(err, null));
+    },
+    pipelining: 0,
+    keepAliveTimeout: 1,
+    keepAliveMaxTimeout: 1,
+  });
+  return { agent, pool };
+}
+
+/** 有 HTTP(S)_PROXY 时按目标选择隧道；否则与原来的直连 Agent 相同。 */
+function createProtectedDispatcher(allowPrivate: boolean): Dispatcher {
+  if (!hasConfiguredHttpProxy()) return createSSRFAgent({ allowPrivate });
+  const direct = createSSRFAgent({ allowPrivate });
+  const tunnels = new Map<string, { agent: Agent; pool: Pool }>();
+  const shutdown = async (destroy: boolean, err?: Error | null) => {
+    const jobs: Array<Promise<void>> = [destroy ? direct.destroy(err ?? null) : direct.close()];
+    for (const tunnel of tunnels.values()) {
+      jobs.push(destroy ? tunnel.agent.destroy(err ?? null) : tunnel.agent.close());
+      jobs.push(destroy ? tunnel.pool.destroy(err ?? null) : tunnel.pool.close());
+    }
+    await Promise.all(jobs);
+  };
+  return {
+    dispatch(opts, handler) {
+      const origin = opts.origin == null ? '' : String(opts.origin);
+      const proxy = origin ? selectEnvProxy(origin) : null;
+      if (!proxy) return direct.dispatch(opts, handler);
+      let tunnel = tunnels.get(proxy);
+      if (!tunnel) {
+        tunnel = makePinnedProxy(proxy, allowPrivate);
+        tunnels.set(proxy, tunnel);
+      }
+      return tunnel.agent.dispatch(opts, handler);
+    },
+    close: () => shutdown(false),
+    destroy: (err?: Error | null) => shutdown(true, err ?? null),
+  } as Dispatcher;
 }
 
 const GLOBAL_FETCH_WRAPPED = Symbol.for('libretv.ssrf.fetch.wrapped');
@@ -240,8 +340,9 @@ export function installFetchSSRFProtection(): void {
       return originalFetch(input, init);
     }
 
-    // 在受保护作用域内，如果未提供专属 dispatcher，自动注入安全专用的 Agent
-    const agent = createSSRFAgent({ allowPrivate: ctx.allowPrivate });
+    // 有 HTTP(S)_PROXY 时走钉死 IP 的 CONNECT 隧道；没有则与原来一样直连。
+    // 自定义 dispatcher 会盖住 Node --use-env-proxy 的全局代理，所以这里自己读环境变量。
+    const agent = createProtectedDispatcher(ctx.allowPrivate === true);
     try {
       // input/init 走 undici 自己的重载签名：DOM 的 Request 类型与 undici 的
       // Request 类型在 duplex 上要求不同，直接传会报类型不兼容，这里只是同族对象互转

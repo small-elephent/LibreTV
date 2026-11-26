@@ -5,13 +5,14 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import { useQuery } from '@tanstack/react-query';
 import { Header } from '@/components/header';
 import { RecommendSection } from '@/components/douban-section';
+import { DiscoveryStrip } from '@/components/discovery-strip';
 import { DetailModal } from '@/components/detail-modal';
 import { AggregatedCard, aggregateResults } from '@/components/video-card';
-import { useAppStore, resolveSource, isInDisabledSubscription, isSourceDisabled } from '@/lib/store';
+import { useAppStore, resolveSource, isInDisabledSubscription, sourceEligibleForSearch } from '@/lib/store';
 import { api } from '@/lib/client-api';
 import type { SearchResultItem, SourceSearchOutcome } from '@/lib/types';
 import { SearchHistoryDropdown, useSearchHistory } from '@/components/search-history';
-import { cn, formatDisableTtl, validateSourceUrl } from '@/lib/utils';
+import { cn, validateSourceUrl } from '@/lib/utils';
 import { useToast } from '@/components/toast';
 import { EmptyState } from '@/components/states';
 import { Icon } from '@/components/icon';
@@ -43,7 +44,6 @@ function HomeContent() {
   const envSources = useAppStore((s) => s.envSources);
   const selectedKeys = useAppStore((s) => s.selectedKeys);
   const yellowFilter = useAppStore((s) => s.yellowFilter);
-  const sourceHealth = useAppStore((s) => s.sourceHealth);
   const subscriptions = useAppStore((s) => s.subscriptions);
   const [input, setInput] = useState(urlQuery);
   const [detailItem, setDetailItem] = useState<SearchResultItem | null>(null);
@@ -72,22 +72,13 @@ function HomeContent() {
         seen.add(s.key);
         return true;
       })
-      // 自动停用期内的源不参与搜索（到期自动恢复）
-      .filter((s) => !isSourceDisabled({ sourceHealth }, s.key))
-      // 所属订阅被整体停用的源同样跳过（无损：各源勾选状态保留，重新启用即恢复）
-      .filter((s) => !isInDisabledSubscription({ subscriptions }, s.key));
-  }, [customAPIs, envSources, selectedKeys, sourceHealth, subscriptions]);
-  const disabledSources = useMemo(
-    () => selectedKeys.filter((key) => isSourceDisabled({ sourceHealth }, key)),
-    [selectedKeys, sourceHealth]
-  );
+      // 手动勾选且所属订阅未被关闭。历史健康度停用不排除源。
+      .filter((s) => sourceEligibleForSearch({ selectedKeys, subscriptions }, s.key));
+  }, [customAPIs, envSources, selectedKeys, subscriptions]);
   // 来自已关闭订阅的源：勾选状态还在，但本次搜索用不到，必须明确告知
   const offSubscriptionSources = useMemo(
-    () =>
-      selectedKeys.filter(
-        (key) => !isSourceDisabled({ sourceHealth }, key) && isInDisabledSubscription({ subscriptions }, key)
-      ),
-    [selectedKeys, sourceHealth, subscriptions]
+    () => selectedKeys.filter((key) => isInDisabledSubscription({ subscriptions }, key)),
+    [selectedKeys, subscriptions]
   );
 
   const searchQuery = useQuery({
@@ -100,14 +91,7 @@ function HomeContent() {
         // 逐源结算即更新：结果边搜边渲染，同时滚动健康度
         onSource: (outcome) => {
           setStreamedOutcomes((prev) => [...prev, outcome]);
-          for (const ev of useAppStore.getState().recordSourceHealth([outcome])) {
-            toast(
-              ev.permanent
-                ? `「${sourceName(ev.key)}」多次失败，已停止参与搜索，可在设置中恢复`
-                : `「${sourceName(ev.key)}」连续超时/失败，已停用 ${formatDisableTtl(ev.ttlMs ?? 0)}`,
-              'warning'
-            );
-          }
+          useAppStore.getState().recordSourceHealth([outcome]);
         },
       });
     },
@@ -312,13 +296,6 @@ function HomeContent() {
               </div>
             )}
 
-            {disabledSources.length > 0 && (
-              <div className="mb-3 text-xs text-faint bg-chip rounded-lg px-3 py-2">
-                {disabledSources.length} 个源因连续超时/失败已暂停参与搜索（临时停用的到期自动恢复，
-                长期停用的需在设置中手动恢复）：{disabledSources.map((key) => sourceName(key)).join('、')}
-              </div>
-            )}
-
             {offSubscriptionSources.length > 0 && (
               <div className="mb-3 text-xs text-faint bg-chip rounded-lg px-3 py-2">
                 {offSubscriptionSources.length} 个源所属的订阅已停用，未参与本次搜索（在设置 → 数据源订阅中可重新启用）：
@@ -362,6 +339,16 @@ function HomeContent() {
               />
             )}
           </section>
+        )}
+
+        {/* 策展在推荐区之上；有搜索时两者都让开结果 */}
+        {!urlQuery && (
+          <DiscoveryStrip
+            onPick={(title) => {
+              setInput(title);
+              runSearch(title);
+            }}
+          />
         )}
 
         {/* 首页推荐（有搜索时隐藏） */}

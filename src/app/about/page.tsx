@@ -20,11 +20,11 @@ export default function AboutPage() {
           <h2 className="text-base font-semibold text-content mb-2.5">快捷键</h2>
           <ul className="text-sm text-muted space-y-1.5 list-disc list-inside">
             <li><code className="text-accent">空格</code> 播放 / 暂停</li>
-            <li><code className="text-accent">←</code> / <code className="text-accent">→</code> 快退 / 快进 5 秒</li>
+            <li><code className="text-accent">←</code> 快退 5 秒；<code className="text-accent">→</code> 轻点快进 5 秒，按住暂时 3 倍速</li>
             <li><code className="text-accent">↑</code> / <code className="text-accent">↓</code> 音量调节</li>
             <li><code className="text-accent">F</code> 切换全屏</li>
             <li><code className="text-accent">Alt + ←/→</code> 上一集 / 下一集</li>
-            <li>移动端长按视频可 3 倍速播放</li>
+            <li>播放速度菜单可选 3 倍；移动端长按视频也是暂时 3 倍</li>
           </ul>
         </section>
 
